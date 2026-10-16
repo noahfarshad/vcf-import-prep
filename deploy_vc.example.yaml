@@ -1,0 +1,58 @@
+esx:
+  build: "12345678"
+  user: root
+sites:
+  site-a:
+    vcenter:
+      fqdn: vc8a.example.com
+      ip: 10.0.0.60
+      prefix: 24
+      gateway: 10.0.0.254
+      dns: [10.0.0.10]
+      sso_domain: vsphere.local
+      size: small
+      vc_user: administrator@vsphere.local
+      vc_password:                           # vc8a.example.com. Blank: asked for
+      root_password:                         # root on the vc8a.example.com appliance. Blank: asked for
+      target:
+        host: esxmgmt01.example.com
+        datastore: ds1
+        network: pg-mgmt
+    datacenter: dc01
+    cluster:
+      name: cluster01
+      ha: true
+      drs: true
+    network:
+      vds: vds01
+      mtu: 9000
+      uplinks: 2
+      pnics: [vmnic0, vmnic1]
+      portgroups:
+        management:
+          name: vds01-pg-mgmt
+          vlan: 110
+        vmotion:
+          name: vds01-pg-vmotion
+          vlan: 141
+        vsan:
+          name: vds01-pg-vsan
+          vlan: 142
+      vmotion:
+        prefix: 24
+        range: 10.0.141.61-99
+      vsan:
+        prefix: 24
+        range: 10.0.142.61-99
+    esx_password:                            # root on the hosts below. Blank: asked for
+    hosts:
+      - esx01.example.com
+      - esx02.example.com
+  site-b:
+    vcenter:
+      fqdn: vc8b.example.com
+    datacenter: dc02
+    cluster:
+      name: cluster02
+    hosts:
+      - esx11.example.com

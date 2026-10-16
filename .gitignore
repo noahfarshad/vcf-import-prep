@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# your config; the example stays
+/env*.yaml
