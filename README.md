@@ -23,8 +23,17 @@ The steps, in order: `dns`, `esx`, `vcsa`, `upgrade`, `objects`, `hosts`, `ntp`,
 
 Every step reads the live environment and plans against it, so a run that stopped part way is finished by running the same command again. After every write the object is read back and reported as it is now, not as the API said.
 
-Not done here: licensing, and the import itself. Standalone hosts that still need to reach the bar VCF checks are [esxi-vcf-host-prep](https://github.com/noahfarshad/esxi-vcf-host-prep).
+Not done here: licensing, and the import itself. The hosts themselves are [esxi-vcf-host-prep](https://github.com/noahfarshad/esxi-vcf-host-prep)'s job, and it runs first.
 
 Passwords come from the config or are asked for by name, and never reach the run log (`/tmp/deploy_vc/<timestamp>/console.txt`).
 
 Needs `pyvmomi` from the `vcsa` step on. Run it with any Python: if the one you typed lacks pyvmomi, the tool looks for one that has it and re-runs itself under it. If no Python on the machine has it, `python3 deploy_vc.py bootstrap` makes a virtualenv the tool then finds on its own. PyYAML is optional.
+
+## Where it sits
+
+Every new cluster, and every day-2 host add, in this order. Each step blocks on the one before it, on purpose.
+
+1. [esxi-vcf-host-prep](https://github.com/noahfarshad/esxi-vcf-host-prep): `esx_ready.sh` takes the hosts themselves to the build, the hostname, one vmkernel, one uplink, one portgroup, clean disks, VMFS-6, a certificate naming the host, and out of maintenance mode. Stale NSX from a previous life comes off here too, with [nsx-host-cleanup](https://github.com/noahfarshad/nsx-host-cleanup) in `--direct` mode.
+2. `deploy_vc.py`, this repository. The `esx` step refuses a cluster whose hosts are on mixed builds.
+3. The VCF import, then the inventory sync in VCF Operations, which stalls on a host without NTP.
+4. [nsx-overlay-prep](https://github.com/noahfarshad/nsx-overlay-prep): the overlay a brownfield import leaves out.
