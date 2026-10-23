@@ -41,13 +41,33 @@ sites:
       vmotion:
         prefix: 24
         range: 10.0.141.61-99
+        # gateway: 10.0.141.254              # only for routed vMotion. Left out, the
+                                             # adapter gets none, which a single-subnet
+                                             # cluster wants. A host whose adapter has a
+                                             # different gateway is reported, never changed
       vsan:
         prefix: 24
         range: 10.0.142.61-99
+        # gateway: 10.0.142.254              # same, for routed vSAN
     esx_password:                            # root on the hosts below. Blank: asked for
     hosts:
       - esx01.example.com
       - esx02.example.com
+    # source: the vCenter these hosts come OUT of, when they are being moved rather
+    # than built new. host_release.py reads it; deploy_vc.py ignores it. One env file
+    # then describes both ends of the move.
+    # source:
+    #   vcenter: oldvc.example.com           # the vCenter these hosts are in today
+    #   user: administrator@vsphere.local
+    #   password:                            # blank: asked for by name, never stored
+    #   cluster: old-cluster-01              # optional: refuse a host found anywhere else
+    #   nsx: oldnsx.example.com              # only if these hosts are NSX-prepared
+    #   nsx_user: admin
+    #   nsx_password:
+    #   min_free_pct: 25                     # refuse an evacuation leaving vSAN tighter
+    #   hosts:                               # exactly the hosts to release. No wildcards
+    #     - esx01.example.com
+    #     - esx02.example.com
   site-b:
     vcenter:
       fqdn: vc8b.example.com

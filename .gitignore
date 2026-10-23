@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 # your config; the example stays
 /env*.yaml
+# nsx_prep.py is nsx-overlay-prep's; copy it beside host_release.py, do not commit it here
+/nsx_prep.py

@@ -200,12 +200,18 @@ KNOWN = {
                     "portgroups": {"management": {"name": None, "vlan": None},
                                    "vmotion": {"name": None, "vlan": None},
                                    "vsan": {"name": None, "vlan": None}},
-                    "vmotion": {"prefix": None, "range": None},
-                    "vsan": {"prefix": None, "range": None}},
+                    # gateway: only for routed vMotion or vSAN. Left out, the adapter
+                    # gets none, which is what a single-subnet cluster wants.
+                    "vmotion": {"prefix": None, "range": None, "gateway": None},
+                    "vsan": {"prefix": None, "range": None, "gateway": None}},
         # ntp: the hosts' time source. Left out, the hosts follow vcenter.ntp, which
         # is what one site normally wants.
         "ntp": None,
         "esx_user": None, "esx_password": None, "hosts": None,
+        # source: the vCenter these hosts come OUT of. host_release owns it and
+        # validates it strictly; this tool only has to tolerate it so one env
+        # file can describe both ends of a migration.
+        "source": "*",
         "extra": "*",
     }},
 }
@@ -921,17 +927,47 @@ class VSphere:
         return ADD, "attached %s (%s)%s" % (fqdn, ",".join(pnics), later)
 
     # ---- vmkernel adapters
-    def ensure_vmk(self, fqdn, dvs, pg_name, ip, mask, mtu, stack, tag, apply_):
+    @staticmethod
+    def vmk_gateway(vnic):
+        """The gateway on one vmkernel, or None. On a non-default stack this is the
+        adapter's own route spec rather than the host's default gateway."""
+        rs = getattr(getattr(vnic, "spec", None), "ipRouteSpec", None)
+        gw = getattr(getattr(rs, "ipRouteConfig", None), "defaultGateway", None)
+        return gw or None
+
+    def ensure_vmk(self, fqdn, dvs, pg_name, ip, mask, mtu, stack, tag, apply_,
+                   gateway=None):
         host = self.find(self.vim.HostSystem, fqdn)
         if host is None:
             return BLOCKED, "%s is not in this vCenter yet" % fqdn
         ns = host.configManager.networkSystem
+        pg = next((p for p in dvs.portgroup if p.name == pg_name), None)
         for vnic in ns.networkInfo.vnic:
             if vnic.spec.ip and vnic.spec.ip.ipAddress == ip:
+                have = self.vmk_gateway(vnic)
+                if have != gateway:
+                    # Reported, never changed. A gateway that differs from the rest of
+                    # the cluster is worth seeing; silently rewriting one is not this
+                    # step's business.
+                    return OK, ("%s %s %s - gateway %s, config says %s"
+                                % (fqdn, vnic.device, ip, have or "none",
+                                   gateway or "none"))
                 return OK, "%s %s %s" % (fqdn, vnic.device, ip)
+        # An adapter already on this portgroup at another address. Adding a second one
+        # would leave the host with two vmkernels on the same subnet.
+        if pg is not None:
+            for vnic in ns.networkInfo.vnic:
+                dvp = getattr(vnic.spec, "distributedVirtualPort", None)
+                if dvp is None or getattr(dvp, "portgroupKey", None) != pg.key:
+                    continue
+                have = getattr(getattr(vnic.spec, "ip", None), "ipAddress", None)
+                if have and have != ip:
+                    return BLOCKED, ("%s: %s is already on %s at %s, not %s. Adding a "
+                                     "second adapter there would put two vmkernels on "
+                                     "one subnet - correct the address or the range"
+                                     % (fqdn, vnic.device, pg_name, have, ip))
         if not apply_:
             return ADD, "%s: vmkernel on %s at %s" % (fqdn, pg_name, ip)
-        pg = next((p for p in dvs.portgroup if p.name == pg_name), None)
         if pg is None:
             return BLOCKED, "%s: portgroup %s does not exist" % (fqdn, pg_name)
         spec = self.vim.host.VirtualNic.Specification(
@@ -941,6 +977,9 @@ class VSphere:
                 switchUuid=dvs.uuid, portgroupKey=pg.key))
         if stack:
             spec.netStackInstanceKey = stack
+        if gateway:
+            spec.ipRouteSpec = self.vim.host.VirtualNic.IpRouteSpec(
+                ipRouteConfig=self.vim.host.IpRouteConfig(defaultGateway=gateway))
         device = ns.AddVirtualNic(portgroup="", nic=spec)
         if tag:
             host.configManager.virtualNicManager.SelectVnicForNicType(nicType=tag, device=device)
@@ -2357,7 +2396,8 @@ def step_vmk(cfg, st, apply_):
                                "subnet collides silently. Move this site's range."
                                % (h, ip, taken, kind))
                 continue
-            r.add(*vs.ensure_vmk(h, dvs, pg, ip, mask, mtu, stack, tag, apply_))
+            r.add(*vs.ensure_vmk(h, dvs, pg, ip, mask, mtu, stack, tag, apply_,
+                                 gateway=opt(cfg, "network.%s.gateway" % kind)))
     return r
 
 
@@ -3090,7 +3130,7 @@ class _FakeVS:
                              "moving it would cut the host off" % (fqdn, self.mgmt_pnic))
         return self._record("attach %s (%s)" % (fqdn, ",".join(pnics)), apply_)
 
-    def ensure_vmk(self, fqdn, dvs, pg, ip, mask, mtu, stack, tag, apply_):
+    def ensure_vmk(self, fqdn, dvs, pg, ip, mask, mtu, stack, tag, apply_, gateway=None):
         return self._record("vmk %s %s %s mask %s stack %s tag %s" % (fqdn, pg, ip, mask, stack, tag), apply_)
 
     def ensure_vsan(self, cluster, want_ha, groups, apply_):
@@ -3163,11 +3203,12 @@ class _FakeVS:
 def selftest():
     checks, failed = [], []
 
-    def ck(name, cond):
+    def ck(name, cond, saw=None):
         checks.append(name)
         if not cond:
             failed.append(name)
-        print("%-4s %s" % ("PASS" if cond else "FAIL", name))
+        print("%-4s %s%s" % ("PASS" if cond else "FAIL", name,
+                             "" if cond or saw is None else "  <- %r" % (saw,)))
 
     cfg = parse_yaml(EXAMPLE)
 
@@ -4403,6 +4444,76 @@ def selftest():
        and "mgmt" in next_line(one, True, "cmd"))
     ck("next: a plan with work points at --commit",
        next_line([Result("vds").add(ADD, "x")], False, "cmd").endswith("--commit"))
+    # ---- ensure_vmk against a host that already has adapters
+    class _Bag:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    def _vnic(device, ip, pgkey=None, gw=None, stack=None):
+        spec = _Bag(ip=_Bag(ipAddress=ip) if ip else None,
+                    distributedVirtualPort=_Bag(portgroupKey=pgkey) if pgkey else None,
+                    netStackInstanceKey=stack,
+                    ipRouteSpec=_Bag(ipRouteConfig=_Bag(defaultGateway=gw)) if gw else None)
+        return _Bag(device=device, spec=spec)
+
+    def _vs_with(vnics):
+        vs = VSphere.__new__(VSphere)
+        host = _Bag(configManager=_Bag(networkSystem=_Bag(networkInfo=_Bag(vnic=vnics))))
+        vs.vim = _Bag(HostSystem=object)
+        vs.find = lambda kind, name: host
+        return vs
+
+    dvs_pg = _Bag(portgroup=[_Bag(name="pg-vmotion", key="dvportgroup-7")])
+
+    st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False)
+    ck("vmk: the right address on the right portgroup is ok", st_ == OK, (st_, d_))
+
+    st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.64", "dvportgroup-7")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False)
+    ck("vmk: an adapter already on that portgroup at another address blocks",
+       st_ == BLOCKED, (st_, d_))
+    ck("vmk: and the block names both addresses",
+       "10.0.141.64" in d_ and "10.0.141.73" in d_, d_)
+    ck("vmk: and says why adding a second one is wrong",
+       "two vmkernels on one subnet" in d_, d_)
+
+    st_, d_ = _vs_with([_vnic("vmk1", "10.9.9.9", "dvportgroup-other")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False)
+    ck("vmk: an adapter on a different portgroup does not block", st_ == ADD, (st_, d_))
+
+    st_, d_ = _vs_with([]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False)
+    ck("vmk: a host with no adapters plans the add", st_ == ADD, (st_, d_))
+
+    # gateway: reported, never rewritten
+    st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7",
+                              gw="10.0.141.254")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False)
+    ck("vmk: a gateway the config did not ask for is reported, not changed",
+       st_ == OK and "gateway 10.0.141.254" in d_ and "config says none" in d_, d_)
+
+    st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False, gateway="10.0.141.254")
+    ck("vmk: a configured gateway that is missing on the host is reported",
+       st_ == OK and "gateway none" in d_, d_)
+
+    st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7",
+                              gw="10.0.141.254")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, False, gateway="10.0.141.254")
+    ck("vmk: a matching gateway is quiet", st_ == OK and "gateway" not in d_, d_)
+
+    ck("config: network.vmotion.gateway is a name the schema knows",
+       check_keys({"sites": {"s": {"network": {"vmotion": {"gateway": "1.2.3.4"}}}}},
+                  KNOWN) == [])
+
     ck("next: a blocked run names the step",
        "clear dns" in next_line([Result("dns").add(BLOCKED, "x")], False, "cmd"))
 
