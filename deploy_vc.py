@@ -195,7 +195,9 @@ KNOWN = {
         "datacenter": None,
         "cluster": {"name": None, "ha": None, "drs": None, "evc": None, "disk_groups": None,
                     "image_seed_from": None},
-        "network": {"vds": None, "mtu": None, "uplinks": None, "pnics": None,
+        # vds_version: the switch version the hosts can join. Left out, 8.0.3, which
+        # ESXi 8 hosts accept; a vCenter left to choose builds the newest it can.
+        "network": {"vds": None, "vds_version": None, "mtu": None, "uplinks": None, "pnics": None,
                     "management": {"device": None, "allow_vlan_change": None},
                     "portgroups": {"management": {"name": None, "vlan": None},
                                    "vmotion": {"name": None, "vlan": None},
@@ -207,6 +209,10 @@ KNOWN = {
         # ntp: the hosts' time source. Left out, the hosts follow vcenter.ntp, which
         # is what one site normally wants.
         "ntp": None,
+        # esx: a site whose hosts run a different build than the shared esx block.
+        # site_config folds the shared one in only when the site has none, so a
+        # site-level block overrides it outright.
+        "esx": {"build": None, "user": None},
         "esx_user": None, "esx_password": None, "hosts": None,
         # source: the vCenter these hosts come OUT of. host_release owns it and
         # validates it strictly; this tool only has to tolerate it so one env
@@ -835,7 +841,7 @@ class VSphere:
         return ADD, "added %s" % fqdn
 
     # ---- distributed switch
-    def ensure_vds(self, dc_name, name, mtu, uplinks, apply_):
+    def ensure_vds(self, dc_name, name, mtu, uplinks, apply_, version=None):
         dc = self.find(self.vim.Datacenter, dc_name)
         if dc is None:
             return BLOCKED, "datacenter %s does not exist yet" % dc_name, None
@@ -848,16 +854,30 @@ class VSphere:
                     configVersion=dvs.config.configVersion, maxMtu=mtu)
                 self.wait(dvs.ReconfigureDvs_Task(spec))
                 return CHANGE, "%s MTU set to %d" % (name, mtu), dvs
-            return OK, "%s (MTU %d)" % (name, mtu), dvs
+            have = getattr(getattr(dvs.config, "productInfo", None), "version", None)
+            if version and have and have != version:
+                # A switch is upgraded one way only: there is no way down from here,
+                # and a host below the switch's version cannot join it. Carrying on
+                # would fail at the host attach with a fault that explains nothing.
+                return BLOCKED, ("%s is version %s, the hosts need %s - delete the switch "
+                                 "in the vSphere Client and run this step again"
+                                 % (name, have, version)), None
+            return OK, "%s (MTU %d%s)" % (name, mtu, have and ", version " + have or ""), dvs
         if not apply_:
-            return ADD, "create %s, %d uplinks, MTU %d" % (name, uplinks, mtu), None
+            return ADD, "create %s, %d uplinks, MTU %d%s" % (
+                name, uplinks, mtu, version and ", version " + version or ""), None
         cfg = self.vim.dvs.VmwareDistributedVirtualSwitch.ConfigSpec(
             name=name, maxMtu=mtu,
             uplinkPortPolicy=self.vim.DistributedVirtualSwitch.NameArrayUplinkPortPolicy(
                 uplinkPortName=["uplink%d" % (i + 1) for i in range(uplinks)]))
-        dvs = self.wait(dc.networkFolder.CreateDVS_Task(
-            self.vim.DistributedVirtualSwitch.CreateSpec(configSpec=cfg)))
-        return ADD, "created %s" % name, dvs
+        # Without a version the vCenter builds the newest switch it can, and a host
+        # below that version cannot join it: "the operation is not supported on the
+        # object". A 9.1.1 vCenter in front of ESXi 8 hosts is exactly that case.
+        spec = self.vim.DistributedVirtualSwitch.CreateSpec(configSpec=cfg)
+        if version:
+            spec.productInfo = self.vim.dvs.ProductSpec(version=version)
+        dvs = self.wait(dc.networkFolder.CreateDVS_Task(spec))
+        return ADD, "created %s%s" % (name, version and " at version " + version or ""), dvs
 
     def ensure_portgroups(self, dvs, wanted, apply_):
         """wanted: {name: vlan}. Returns a list of (state, detail)."""
@@ -945,14 +965,27 @@ class VSphere:
         for vnic in ns.networkInfo.vnic:
             if vnic.spec.ip and vnic.spec.ip.ipAddress == ip:
                 have = self.vmk_gateway(vnic)
-                if have != gateway:
-                    # Reported, never changed. A gateway that differs from the rest of
-                    # the cluster is worth seeing; silently rewriting one is not this
-                    # step's business.
-                    return OK, ("%s %s %s - gateway %s, config says %s"
-                                % (fqdn, vnic.device, ip, have or "none",
-                                   gateway or "none"))
-                return OK, "%s %s %s" % (fqdn, vnic.device, ip)
+                if have == gateway:
+                    return OK, "%s %s %s" % (fqdn, vnic.device, ip)
+                if gateway is None:
+                    # A gateway nobody asked for is reported, not removed. Taking one
+                    # away is the riskier direction and no config says to.
+                    return OK, ("%s %s %s - gateway %s, config sets none"
+                                % (fqdn, vnic.device, ip, have))
+                if not apply_:
+                    return CHANGE, ("%s %s: gateway %s -> %s"
+                                    % (fqdn, vnic.device, have or "none", gateway))
+                spec = vnic.spec
+                spec.ipRouteSpec = self.vim.host.VirtualNic.IpRouteSpec(
+                    ipRouteConfig=self.vim.host.IpRouteConfig(defaultGateway=gateway))
+                ns.UpdateVirtualNic(device=vnic.device, nic=spec)
+                after = next((self.vmk_gateway(v) for v in
+                              host.configManager.networkSystem.networkInfo.vnic
+                              if v.device == vnic.device), None)
+                if after != gateway:
+                    return BLOCKED, ("%s %s: gateway reads back as %s, not %s"
+                                     % (fqdn, vnic.device, after or "none", gateway))
+                return CHANGE, "%s %s: gateway set to %s" % (fqdn, vnic.device, gateway)
         # An adapter already on this portgroup at another address. Adding a second one
         # would leave the host with two vmkernels on the same subnet.
         if pg is not None:
@@ -2352,7 +2385,8 @@ def step_vds(cfg, st, apply_):
         return r.add(BLOCKED, "the vCenter is not up yet")
     mtu = int(opt(cfg, "network.mtu", 9000))
     state, detail, dvs = vs.ensure_vds(cfg["datacenter"], need(cfg, "network.vds", "the switch name"),
-                                       mtu, int(opt(cfg, "network.uplinks", 2)), apply_)
+                                       mtu, int(opt(cfg, "network.uplinks", 2)), apply_,
+                                       opt(cfg, "network.vds_version", "8.0.3"))
     r.add(state, detail)
     st["dvs"] = dvs
     if dvs is None:
@@ -2492,11 +2526,10 @@ def ntp_servers(cfg):
 
 
 def step_ntp(cfg, st, apply_):
-    """NTP on every host. VCF checks this at import and again at every inventory sync.
+    """NTP on every host. VCF checks this at import and at every inventory sync.
 
-    It is not cosmetic: the import refuses a host whose clock is unmanaged, and an
-    inventory sync against a domain that already imported will fail the same way
-    later. Both of those have cost us a session, so it is a step rather than a note.
+    The import refuses a host whose clock is unmanaged, and an inventory sync
+    against an already-imported domain fails the same way.
     """
     r = Result("ntp")
     servers = ntp_servers(cfg)
@@ -2716,8 +2749,8 @@ def next_line(results, commit, cmd):
         return "NEXT: clear %s, then %s" % (blocked[0].step, cmd)
     if pending:
         return "NEXT: %s --commit" % cmd if not commit else "NEXT: %s" % cmd
-    # A clean --only run says nothing about the steps that did not run, and sending
-    # someone to the import on the strength of one green step is worse than silence.
+    # A clean --only run says nothing about the steps that did not run, so name
+    # them rather than reporting the site as ready.
     rest = [s for s in STEPS if s not in {r.step for r in results}]
     if rest:
         return "NEXT: %s is clean. Not run: %s" % (
@@ -3117,8 +3150,8 @@ class _FakeVS:
     def ensure_host(self, cluster, fqdn, pw, apply_):
         return self._record("host %s" % fqdn, apply_)
 
-    def ensure_vds(self, dc, name, mtu, uplinks, apply_):
-        s, d = self._record("vds %s mtu %d" % (name, mtu), apply_)
+    def ensure_vds(self, dc, name, mtu, uplinks, apply_, version=None):
+        s, d = self._record("vds %s mtu %d version %s" % (name, mtu, version), apply_)
         return s, d, object()
 
     def ensure_portgroups(self, dvs, wanted, apply_):
@@ -3301,6 +3334,16 @@ def selftest():
            and sum(1 for m in fake2.mutations if m.startswith("attach")) == 2)
         ck("apply: portgroup VLANs come from the config",
            any("vlan 142" in m for m in fake2.mutations))
+        # A switch built at the vCenter's newest version refuses every host below
+        # it. The hosts here are ESXi 8, the vCenter is 9.1.1, so the version is
+        # pinned and must reach the create call.
+        ck("apply: the switch is created at the configured version",
+           any(m.startswith("vds") and "version 8.0.3" in m for m in fake2.mutations))
+        verc = copy.deepcopy(cfg); verc["network"]["vds_version"] = "7.0.3"
+        fake3 = _FakeVS(present=cfg["hosts"]); g["_connect"] = lambda c, s: fake3
+        step_vds(verc, dict(st), True)
+        ck("apply: an explicit vds_version wins",
+           any("version 7.0.3" in m for m in fake3.mutations))
 
         nomgmt = json.loads(json.dumps(cfg))
         nomgmt["network"]["portgroups"]["management"] = {"name": "[set]", "vlan": "[set]"}
@@ -3678,7 +3721,7 @@ def selftest():
            any(s == OK and "a datastore every host can see" in d for s, d in res.rows))
 
         # vSAN switched off leaves the disks claimed and everything else looking
-        # fine. Only the import's common-datastore check caught it, at the second site.
+        # correct; the common-datastore check is what catches it.
         fnd = _FakeVS(present=cfg["hosts"])
         fnd.imaged = True
         fnd.already = set(cfg["hosts"])
@@ -4495,14 +4538,42 @@ def selftest():
                               gw="10.0.141.254")]).ensure_vmk(
         "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
         "vmotion", None, False)
-    ck("vmk: a gateway the config did not ask for is reported, not changed",
-       st_ == OK and "gateway 10.0.141.254" in d_ and "config says none" in d_, d_)
+    ck("vmk: a gateway the config did not ask for is reported, not removed",
+       st_ == OK and "gateway 10.0.141.254" in d_ and "config sets none" in d_, d_)
 
     st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7")]).ensure_vmk(
         "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
         "vmotion", None, False, gateway="10.0.141.254")
-    ck("vmk: a configured gateway that is missing on the host is reported",
-       st_ == OK and "gateway none" in d_, d_)
+    ck("vmk: a configured gateway missing on the host is a planned change",
+       st_ == CHANGE and "none -> 10.0.141.254" in d_, d_)
+
+    applied = {}
+
+    class _NS:
+        def __init__(self, vnics):
+            self.networkInfo = _Bag(vnic=vnics)
+        def UpdateVirtualNic(self, device=None, nic=None):
+            applied["device"] = device
+            applied["gw"] = nic.ipRouteSpec.ipRouteConfig.defaultGateway
+            for v in self.networkInfo.vnic:
+                if v.device == device:
+                    v.spec.ipRouteSpec = nic.ipRouteSpec
+
+    def _vs_live(vnics):
+        vs = VSphere.__new__(VSphere)
+        host = _Bag(configManager=_Bag(networkSystem=_NS(vnics)))
+        vs.vim = _Bag(HostSystem=object,
+                      host=_Bag(VirtualNic=_Bag(IpRouteSpec=lambda ipRouteConfig: _Bag(ipRouteConfig=ipRouteConfig)),
+                                IpRouteConfig=lambda defaultGateway: _Bag(defaultGateway=defaultGateway)))
+        vs.find = lambda kind, name: host
+        return vs
+
+    st_, d_ = _vs_live([_vnic("vmk1", "10.0.141.73", "dvportgroup-7")]).ensure_vmk(
+        "esx13", dvs_pg, "pg-vmotion", "10.0.141.73", "255.255.255.0", 9000,
+        "vmotion", None, True, gateway="10.0.141.254")
+    ck("vmk: on commit the gateway is set and read back",
+       st_ == CHANGE and applied.get("gw") == "10.0.141.254", (st_, d_, applied))
+    ck("vmk: and it names the adapter it changed", "vmk1" in d_, d_)
 
     st_, d_ = _vs_with([_vnic("vmk1", "10.0.141.73", "dvportgroup-7",
                               gw="10.0.141.254")]).ensure_vmk(
@@ -4513,6 +4584,16 @@ def selftest():
     ck("config: network.vmotion.gateway is a name the schema knows",
        check_keys({"sites": {"s": {"network": {"vmotion": {"gateway": "1.2.3.4"}}}}},
                   KNOWN) == [])
+    ck("config: network.vds_version is a name the schema knows",
+       check_keys({"sites": {"s": {"network": {"vds_version": "8.0.3"}}}}, KNOWN) == [])
+
+    ck("config: a site may carry its own esx build",
+       check_keys({"sites": {"s": {"esx": {"build": "25714478"}}}}, KNOWN) == [])
+    _shared = {"esx": {"build": "1111"}, "sites": {"a": {}, "b": {"esx": {"build": "2222"}}}}
+    ck("config: a site without its own esx block inherits the shared one",
+       site_config(_shared, "a")["esx"]["build"] == "1111")
+    ck("config: a site with one overrides it",
+       site_config(_shared, "b")["esx"]["build"] == "2222")
 
     ck("next: a blocked run names the step",
        "clear dns" in next_line([Result("dns").add(BLOCKED, "x")], False, "cmd"))

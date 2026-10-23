@@ -12,7 +12,7 @@ The example config calls the sites `site-a` and `site-b`, and the hosts are `exa
 ## Run
 
 ```bash
-python3 deploy_vc.py selftest                                   # 256 checks, no environment needed
+python3 deploy_vc.py selftest                                   # 264 checks, no environment needed
 cp deploy_vc.example.yaml env_vc8.yaml                          # then edit the sites, hosts and ranges
 python3 deploy_vc.py build --config env_vc8.yaml                # plan: reads everything, writes nothing
 python3 deploy_vc.py build --config env_vc8.yaml --commit
@@ -21,9 +21,11 @@ python3 deploy_vc.py build --config env_vc8.yaml --only image   # one step; repe
 
 The steps, in order: `dns`, `esx`, `vcsa`, `upgrade`, `objects`, `hosts`, `ntp`, `vds`, `vmk`, `mgmt`, `vsan`, `image`, `ssh`, `ready`. `ntp` sits right after `hosts` because vSAN wants the clocks together before it forms a cluster and the import refuses a host whose time is unmanaged. `mgmt` moves vmk0 and the uplink carrying it in one host transaction; that uplink stays out of `network.pnics`. `image` seeds the cluster's vLCM image from a host already in it: the import refuses a baseline-managed cluster.
 
-`vmk` adds the vMotion and vSAN adapters from the configured ranges. A host that already has an adapter on that portgroup at another address is refused, naming both addresses, because adding a second one would put two vmkernels on one subnet. `network.vmotion.gateway` and `network.vsan.gateway` are for routed vMotion or vSAN; left out, the adapter gets none, and an adapter that already carries a different gateway is reported, never rewritten.
+`vds` creates the switch at `network.vds_version`, 8.0.3 unless set. Left to choose, a 9.1.1 vCenter builds a version 9 switch, and an ESXi 8 host cannot join it: the host attach fails with "the operation is not supported on the object", which explains nothing. A switch that already exists at another version blocks the step with the version it found and the one the hosts need, because a distributed switch is upgraded one way only: delete it in the vSphere Client and run the step again. A site whose hosts run a different build than the shared `esx:` block carries its own `esx:` block, which replaces the shared one outright.
 
-`--precheck` checks the appliance deploy or upgrade without touching anything. `--vendor-precheck` also runs vcsa-deploy's own precheck, which on a 9.x upgrade updates vLCM on the source appliance, so it needs `--commit`. `--set NAME=VALUE` changes one config value by its full name, then stops. `--detailed-exitcode`: 0 nothing pending, 2 pending, 1 blocked.
+`vmk` adds the vMotion and vSAN adapters from the configured ranges. A host that already has an adapter on that portgroup at another address is refused, naming both addresses, because adding a second one would put two vmkernels on one subnet. `network.vmotion.gateway` and `network.vsan.gateway` are for routed vMotion or vSAN. A configured gateway that is missing on the host is a planned change, set on commit and read back; a gateway nobody asked for is reported, never removed, because taking one away is the riskier direction and no config says to.
+
+`--set NAME=VALUE` changes one config value by its full name and stops, writing a backup of the file first, so a range left blank is filled from the command line rather than by editing a live file: `--set sites.site-a.network.vmotion.range=10.0.141.61-99`. `--precheck` checks the appliance deploy or upgrade without touching anything. `--vendor-precheck` also runs vcsa-deploy's own precheck, which on a 9.x upgrade updates vLCM on the source appliance, so it needs `--commit`. `--detailed-exitcode`: 0 nothing pending, 2 pending, 1 blocked.
 
 Every step reads the live environment and plans against it, so a run that stopped part way is finished by running the same command again. After every write the object is read back and reported as it is now, not as the API said.
 

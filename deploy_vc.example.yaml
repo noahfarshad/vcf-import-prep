@@ -25,6 +25,9 @@ sites:
       drs: true
     network:
       vds: vds01
+      # vds_version: 8.0.3                  # the switch version the hosts can join. Left out, 8.0.3.
+                                             # A vCenter left to choose builds the newest it can, and
+                                             # an ESXi 8 host cannot join a version 9 switch
       mtu: 9000
       uplinks: 2
       pnics: [vmnic0, vmnic1]
@@ -69,6 +72,8 @@ sites:
     #     - esx01.example.com
     #     - esx02.example.com
   site-b:
+    # esx:                                   # a site whose hosts run a different build than the
+    #   build: "87654321"                    # shared esx: block above; a site-level block replaces it
     vcenter:
       fqdn: vc8b.example.com
     datacenter: dc02

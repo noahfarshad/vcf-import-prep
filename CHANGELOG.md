@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.1] — 2026-10-23
+
+### Added
+
+- `network.vds_version` (default `8.0.3`): the distributed switch is created at a version the hosts can join. Left to choose, a 9.1.1 vCenter builds a version 9 switch and an ESXi 8 host cannot join it; the host attach fails with "the operation is not supported on the object". A switch that already exists at another version blocks the `vds` step, naming the version it found and the one the hosts need, because a switch is upgraded one way only: delete it in the vSphere Client and run the step again.
+- A per-site `esx:` block (`build`, `user`) that replaces the shared one outright, for a site whose hosts run a different build.
+
+### Changed
+
+- `vmk`: a configured `gateway` that is missing on a host is now a planned change, set on commit with `UpdateVirtualNic` and read back. A gateway nobody asked for is still reported, never removed.
+- `deploy_vc.py selftest` is 264 checks (was 256): the switch version reaches the create call, an explicit `vds_version` wins, the schema knows it, a site inherits or overrides the shared `esx:` block, and the gateway is set and read back on commit.
+
+### Notes
+
+- Found on the first run against a 9.1.1 vCenter in front of ESXi 8 hosts: the appliance deployed, the cluster formed, the hosts joined, and the `vds` step was the first thing that could not be read back as asked.
+
 ## [1.1.0] — 2026-10-23
 
 ### Added
