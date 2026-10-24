@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] — 2026-10-24
+
+### Added
+
+- `image` sets the desired image before it enables image management. A cluster created before any host joined has no image - nothing was there to seed it from - and the enablement check fails on exactly that. The step now takes the image from a host already in the cluster, over the documented calls behind Setup Image > Import image from a host: `esx/settings/depots/offline?action=createFromHost` extracts what the host runs into the depot, the specification it returns is imported as a draft (`import-software-spec`), the draft is committed, then the enablement check and the enable run as before. The desired image is what the hosts run, so nothing is non-compliant and nothing is remediated. The imported specification is kept in the evidence directory. An image that cannot be read is not mistaken for one that is missing, and a draft someone left open on the cluster blocks the step, naming its owner, rather than being overwritten.
+- `objects` seeds a brand-new vCenter's first cluster from the site's first host: `CreateClusterEx` takes a connect spec for a host not yet in the inventory, joins it to the cluster and takes its image in one call. Until now a seed needed a host already in the vCenter, which a fresh one does not have, and the cluster was created baseline-managed.
+- `cluster.image_seed_from`, now documented: `auto` (the default), a host name, or `none` for a baseline-managed cluster the `image` step converts later.
+
+### Changed
+
+- `deploy_vc.py selftest` is 289 checks (was 264): the image taken from a host before the enable, the exact call sequence and bodies, the open-draft and unreadable-image blocks, the extract cut down to what the import takes, and the cluster's birth seeded from a new host, an existing host, a named host, or not at all.
+- The tool's own version string is `deploy_vc.py` 1.1, so the run log says which copy ran.
+
+### Notes
+
+- Found on the first run against a 9.1.1 vCenter: the cluster was created before its hosts joined, so it had no vLCM image, and the import would have refused it. Settling that before the import rather than after is what this release is for.
+- The conversion sequence is exercised against the self-test's stubbed REST side, call by call and body by body, against the API reference. The first live run is the plan, which sends nothing, then `--only image --commit`.
+
 ## [1.1.1] — 2026-10-23
 
 ### Added

@@ -23,6 +23,11 @@ sites:
       name: cluster01
       ha: true
       drs: true
+      # image_seed_from: auto                # the host whose vLCM image the cluster is born on. Left out, auto:
+                                             # a connected host already in the vCenter at the build or, on a fresh
+                                             # vCenter, the first host below, which joins the cluster as it is made.
+                                             # A host name picks one; none makes a baseline-managed cluster, which
+                                             # the image step converts later
     network:
       vds: vds01
       # vds_version: 8.0.3                  # the switch version the hosts can join. Left out, 8.0.3.

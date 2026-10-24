@@ -12,16 +12,18 @@ The example config calls the sites `site-a` and `site-b`, and the hosts are `exa
 ## Run
 
 ```bash
-python3 deploy_vc.py selftest                                   # 264 checks, no environment needed
+python3 deploy_vc.py selftest                                   # 289 checks, no environment needed
 cp deploy_vc.example.yaml env_vc8.yaml                          # then edit the sites, hosts and ranges
 python3 deploy_vc.py build --config env_vc8.yaml                # plan: reads everything, writes nothing
 python3 deploy_vc.py build --config env_vc8.yaml --commit
 python3 deploy_vc.py build --config env_vc8.yaml --only image   # one step; repeatable
 ```
 
-The steps, in order: `dns`, `esx`, `vcsa`, `upgrade`, `objects`, `hosts`, `ntp`, `vds`, `vmk`, `mgmt`, `vsan`, `image`, `ssh`, `ready`. `ntp` sits right after `hosts` because vSAN wants the clocks together before it forms a cluster and the import refuses a host whose time is unmanaged. `mgmt` moves vmk0 and the uplink carrying it in one host transaction; that uplink stays out of `network.pnics`. `image` seeds the cluster's vLCM image from a host already in it: the import refuses a baseline-managed cluster.
+The steps, in order: `dns`, `esx`, `vcsa`, `upgrade`, `objects`, `hosts`, `ntp`, `vds`, `vmk`, `mgmt`, `vsan`, `image`, `ssh`, `ready`. `ntp` sits right after `hosts` because vSAN wants the clocks together before it forms a cluster and the import refuses a host whose time is unmanaged. `mgmt` moves vmk0 and the uplink carrying it in one host transaction; that uplink stays out of `network.pnics`. `objects` creates the cluster on a vLCM image seeded from a host, and `image` converts one that exists without an image: the import refuses a baseline-managed cluster.
 
 `vds` creates the switch at `network.vds_version`, 8.0.3 unless set. Left to choose, a 9.1.1 vCenter builds a version 9 switch, and an ESXi 8 host cannot join it: the host attach fails with "the operation is not supported on the object", which explains nothing. A switch that already exists at another version blocks the step with the version it found and the one the hosts need, because a distributed switch is upgraded one way only: delete it in the vSphere Client and run the step again. A site whose hosts run a different build than the shared `esx:` block carries its own `esx:` block, which replaces the shared one outright.
+
+The cluster is born on a vLCM image. `cluster.image_seed_from` names the host whose image it takes: `auto`, the default, uses a connected host already in the vCenter at the expected build or, on a fresh vCenter that has none, the first host of the site, which `CreateClusterEx` joins to the new cluster and takes the image from in one call; a host name picks one; `none` makes a baseline-managed cluster. A cluster that exists without an image, as one created before any host joined does, is converted by `image`: it takes the image from a host already in the cluster, over the documented calls behind Setup Image > Import image from a host in the vSphere Client (the depot import from the host, a draft, a commit), runs the enablement check and enables image management. The desired image is exactly what the hosts run, so nothing is non-compliant and nothing is remediated; the imported specification is kept in the evidence directory. One way: a cluster on an image cannot go back to baselines, so the conversion only runs under `--commit`, an image that cannot be read is not mistaken for one that is missing, and a draft someone left open on the cluster blocks the step rather than being overwritten.
 
 `vmk` adds the vMotion and vSAN adapters from the configured ranges. A host that already has an adapter on that portgroup at another address is refused, naming both addresses, because adding a second one would put two vmkernels on one subnet. `network.vmotion.gateway` and `network.vsan.gateway` are for routed vMotion or vSAN. A configured gateway that is missing on the host is a planned change, set on commit and read back; a gateway nobody asked for is reported, never removed, because taking one away is the riskier direction and no config says to.
 

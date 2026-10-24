@@ -19,13 +19,13 @@ Steps:
   esx      each host reachable, build read without logging in
   vcsa     writes the vcsa-deploy spec, runs it when installer: is set
   upgrade  upgrades the appliance to upgrade.target, when one is set
-  objects  datacenter and cluster: HA, DRS, EVC
+  objects  datacenter and cluster: HA, DRS, EVC, born on a vLCM image seeded from a host
   hosts    each ESX host added to the cluster
   vds      distributed switch, uplinks, portgroups
   vmk      vMotion and vSAN vmkernel adapters from the configured ranges
   mgmt     vmk0 and the uplink carrying it, moved onto the distributed switch
   vsan     vSAN enabled on the cluster
-  image    the cluster managed by a vLCM image, seeded from a host already in it
+  image    the cluster managed by a vLCM image - taken from a host in it when it has none
   ssh      SSH on the appliance - the import needs it
   ready    import prerequisites
 
@@ -56,7 +56,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1"
 # ntp sits right after hosts: it is the first thing that can be set once a host is in
 # the vCenter, vSAN wants the clocks together before it forms a cluster, and the VCF
 # import refuses a host whose time is unmanaged. Late is how it got missed twice.
@@ -193,6 +193,9 @@ KNOWN = {
                                "password": None, "appliance_name": None},
                     "temp_ip": None},
         "datacenter": None,
+        # image_seed_from: the host whose image a new cluster is born on - auto (left
+        # out), a host name, or none for a baseline-managed cluster the image step
+        # converts later.
         "cluster": {"name": None, "ha": None, "drs": None, "evc": None, "disk_groups": None,
                     "image_seed_from": None},
         # vds_version: the switch version the hosts can join. Left out, 8.0.3, which
@@ -716,9 +719,9 @@ class VSphere:
         """A host already in this vCenter whose running image can seed a new cluster.
 
         `want` is a host name, or "auto" to take any connected host at the expected
-        build. Seeding only works at creation, so the only candidates are hosts
-        already in the inventory - for a second cluster on a vCenter that is exactly
-        the first cluster's hosts, which run the same image by design.
+        build - for a second cluster on a vCenter that is exactly the first cluster's
+        hosts, which run the same image by design. A fresh vCenter has none, which
+        is what the new-host seed in ensure_cluster is for.
         """
         if not want:
             return None, ""
@@ -736,55 +739,89 @@ class VSphere:
         return None, ("no connected host in this vCenter%s to seed an image from"
                       % (" at build %s" % build if build else ""))
 
-    def ensure_cluster(self, dc_name, name, ha, drs, evc, apply_, seed=None, build=None):
+    def connect_spec(self, fqdn, password):
+        """What AddHost and a seed from a new host both take: root, thumbprint, force."""
+        return self.vim.host.ConnectSpec(hostName=fqdn, userName="root", password=password,
+                                         sslThumbprint=thumbprint(fqdn), force=True)
+
+    def ensure_cluster(self, dc_name, name, ha, drs, evc, apply_, seed=None, build=None,
+                       candidates=(), password=None):
+        """The cluster, born on a vLCM image when it can be.
+
+        The import refuses a baseline-managed cluster, and converting one afterwards
+        is a one-way change that needs a desired image first. Born on an image, none
+        of that applies. The seed is a host already in the vCenter at the expected
+        build or, when there is none - a fresh vCenter, whose first cluster is the
+        case that matters - the first host of this site: CreateClusterEx takes a
+        connect spec for a host not yet in the inventory, joins it and takes its
+        image in one call. `candidates` is the site's host list and `password` a
+        callable for root on them, asked only when that seed is used.
+        """
         dc = self.find(self.vim.Datacenter, dc_name)
         if dc is None:
             return BLOCKED, "datacenter %s does not exist yet" % dc_name
         existing = self.find(self.vim.ClusterComputeResource, name, dc.hostFolder)
         if existing:
             if seed and not getattr(existing, "lifecycleManaged", False):
-                return OK, ("cluster %s - already there, so it cannot be seeded with an "
-                            "image now. Seeding only works at creation; use --only image "
-                            "--commit to convert it" % name)
+                return OK, ("cluster %s - already there and baseline-managed. Seeding only "
+                            "works at creation; the image step converts it" % name)
             return OK, "cluster %s" % name
         seed_host, why = (self.seed_host(seed, build) if seed else (None, ""))
+        new_host = None
+        if seed and seed_host is None:
+            want = str(seed).lower()
+            new_host = next((str(h) for h in candidates
+                             if want == "auto" or str(h).lower() == want), None)
+        seeded_from = seed_host.name if seed_host is not None else new_host
         if not apply_:
+            how = ""
+            if seed:
+                how = (", on a vLCM image seeded from %s%s" % (
+                    seeded_from, ", which joins it as its first host" if new_host else "")
+                       if seeded_from else ", baseline-managed: %s" % why)
             return ADD, "create cluster %s (DRS %s%s)%s%s" % (
                 name, "on" if drs else "off", ", EVC %s" % evc if evc else "",
-                "; HA on after vSAN" if ha else "",
-                (", on a vLCM image seeded from %s" % seed_host.name if seed_host
-                 else ", baseline-managed: %s" % why) if seed else "")
+                "; HA on after vSAN" if ha else "", how)
         # Created bare on purpose. CreateClusterEx refuses a dasConfig that carries only
         # `enabled` (InvalidArgument: spec.dasConfig), so HA and DRS go on afterwards,
         # where a refusal costs the settings rather than the cluster.
         spec = self.vim.cluster.ConfigSpecEx()
         notes = []
-        if seed and seed_host is not None:
-            # The import refuses a baseline-managed cluster, and converting one
-            # afterwards is a one-way change that needs a committed software draft
-            # first. Born on an image, none of that applies.
-            v = self.vim
+        v = self.vim
+        if seed_host is not None:
             spec.hostSeedSpec = v.ComputeResource.HostSeedSpec(
                 singleHostSpec=v.ComputeResource.HostSeedSpec.SingleHostSpec(
                     existingHost=seed_host))
+        elif new_host:
+            try:
+                cnx = self.connect_spec(new_host, password() if callable(password) else password)
+            except Exception as e:
+                return BLOCKED, ("%s: cannot read its certificate (%s), and it is the host "
+                                 "cluster %s would take its image from. Fix the host, or name "
+                                 "another host of this site in cluster.image_seed_from"
+                                 % (new_host, fault(e), name))
+            spec.hostSeedSpec = v.ComputeResource.HostSeedSpec(
+                singleHostSpec=v.ComputeResource.HostSeedSpec.SingleHostSpec(
+                    newHostCnxSpec=cnx))
         elif seed:
             notes.append("not seeded with an image: %s" % why)
         try:
             cl = dc.hostFolder.CreateClusterEx(name=name, spec=spec)
         except Exception as e:
-            if seed and seed_host is not None:
-                return BLOCKED, ("cannot create cluster %s seeded from %s: %s. Remove "
-                                 "cluster.image_seed_from to create it baseline-managed "
-                                 "and convert with --only image --commit instead"
-                                 % (name, seed_host.name, fault(e)))
+            if seeded_from:
+                return BLOCKED, ("cannot create cluster %s seeded from %s: %s. Set "
+                                 "cluster.image_seed_from: none to create it baseline-managed; "
+                                 "the image step then converts it"
+                                 % (name, seeded_from, fault(e)))
             return BLOCKED, "cannot create cluster %s: %s" % (name, fault(e))
-        if seed and seed_host is not None:
+        if seeded_from:
             # Say what it actually is, not what was asked for.
             if getattr(cl, "lifecycleManaged", False):
-                notes.append("on a vLCM image seeded from %s" % seed_host.name)
+                notes.append("on a vLCM image seeded from %s%s" % (
+                    seeded_from, ", which joined it as its first host" if new_host else ""))
             else:
                 notes.append("the image seed did not take - it is baseline-managed, "
-                             "so --only image --commit is still needed")
+                             "so the image step converts it")
         try:
             # HA deliberately off here: vSAN cannot be configured while it is on,
             # and step_vsan turns it on once the datastore has capacity.
@@ -1324,6 +1361,8 @@ class VSphere:
 
     # ---- vSphere Lifecycle Manager
     IMAGE_PATH = "/esx/settings/clusters/%s/enablement/software"
+    SPEC_PATH = "/esx/settings/clusters/%s/software"
+    DEPOT_FROM_HOST = "/esx/settings/depots/offline?action=createFromHost"
 
     def image_enabled(self, moid):
         """Whether the cluster is image-managed, asked of the service that owns it.
@@ -1363,13 +1402,77 @@ class VSphere:
                 seen.append((ver, build))
         return seen
 
+    def image_spec(self, moid):
+        """The cluster's desired image, if it has one: (spec, why).
+
+        A cluster created before any host joined has none - nothing was there to
+        seed it from - and that is the case this step exists for. None with an
+        empty `why` means no image; None with a reason means the answer could not
+        be read, which is a different thing and stops the step.
+        """
+        try:
+            info = self.vapi().call("GET", self.SPEC_PATH % moid)
+        except Exception as e:
+            text = str(e)
+            # 404 is the documented no-such-document answer, and a 400 on this GET is
+            # the service saying the cluster is not set up for images. Anything else
+            # is the service not answering, and nothing one-way follows a guess.
+            if ": 404 " in text or ": 400 " in text:
+                return None, ""
+            return None, text
+        if isinstance(info, dict) and isinstance(info.get("base_image"), dict) \
+                and info["base_image"].get("version"):
+            return info, ""
+        return None, ""
+
+    def image_drafts(self, moid):
+        """Software drafts open on the cluster, {id: {owner, status, creation_time}}."""
+        try:
+            return self.vapi().call("GET", (self.SPEC_PATH % moid) + "/drafts") or {}, ""
+        except Exception as e:
+            return {}, str(e)
+
+    def image_from_host(self, moid, host, evidence=None, cluster_name=""):
+        """Make what one host runs the cluster's desired image.
+
+        What Setup Image > Import image from a host does in the vSphere Client, as
+        the three documented calls behind it: extract the host's software into the
+        depot (depots/offline createFromHost, which also uploads any component the
+        depot lacks), import the specification it returns as a draft, commit the
+        draft. The desired image is then exactly the installed one, so every host
+        is compliant and nothing needs remediating.
+        """
+        hid = getattr(host, "_moId", None) or str(host)
+        info = self.vapi().task("POST", self.DEPOT_FROM_HOST,
+                                {"auth_type": "EXISTING", "host": hid}, minutes=60)
+        spec = image_spec_to_import(info.get("software_spec") if isinstance(info, dict) else None)
+        if spec is None:
+            raise RuntimeError("the depot import from %s returned no software specification (%s)"
+                               % (host.name, vapi_message(info) or "empty answer"))
+        if evidence:
+            try:
+                with open(os.path.join(evidence, "image-%s.spec.json" % cluster_name), "w") as fh:
+                    json.dump(spec, fh, indent=2, sort_keys=True)
+            except OSError:
+                pass
+        draft = self.vapi().call("POST", (self.SPEC_PATH % moid) + "/drafts?action=import-software-spec",
+                                 {"source_type": "JSON_STRING", "software_spec": json.dumps(spec)})
+        if not isinstance(draft, str) or not draft:
+            raise RuntimeError("the draft import returned %r instead of a draft id" % (draft,))
+        self.vapi().task("POST", (self.SPEC_PATH % moid) + "/drafts/%s?action=commit"
+                         % urllib.parse.quote(draft, safe=""),
+                         {"message": "deploy_vc.py: the image %s runs, imported from the host"
+                                     % host.name}, minutes=30)
+        return spec
+
     def ensure_cluster_image(self, cluster_name, apply_, evidence=None):
         """A cluster managed by a vLCM image rather than by baselines.
 
         The VCF import refuses a baseline-managed cluster outright. This is the
-        documented Image Manager enablement API - check, then enable, then verify -
-        rather than the vSphere Client walk-through, because we repeat this at every
-        site. It is one-way, so it only runs under --commit.
+        documented Image Manager enablement API - a desired image first, then
+        check, enable, verify - rather than the vSphere Client walk-through,
+        because we repeat this at every site. It is one-way, so it only runs
+        under --commit.
         """
         cl = self.find(self.vim.ClusterComputeResource, cluster_name)
         if cl is None:
@@ -1400,11 +1503,49 @@ class VSphere:
 
         builds = self.image_seed_version(cl)
         running = ", ".join("%s build %s" % (v, b) for v, b in builds) or "an unknown build"
+
+        # The desired image. A cluster created before its hosts joined has none, and
+        # the enablement check fails on exactly that (SOFTWARE_SPECIFICATION_EXISTENCE),
+        # so it is set first, from a host in the cluster: what the hosts run is what
+        # the image should be.
+        spec, why = self.image_spec(moid)
+        source = None
+        if spec is None:
+            if why:
+                return BLOCKED, ("%s: cannot read whether it has a desired image (%s), so "
+                                 "nothing one-way is attempted" % (cluster_name, why))
+            drafts, why = self.image_drafts(moid)
+            if why:
+                return BLOCKED, ("%s: cannot list its software drafts (%s), so nothing "
+                                 "one-way is attempted" % (cluster_name, why))
+            if drafts:
+                owners = sorted({str((d or {}).get("owner") or "someone")
+                                 for d in drafts.values()})
+                return BLOCKED, ("%s has %d software draft%s open already (%s). Importing the "
+                                 "image would collide with it: finish or discard it in the "
+                                 "vSphere Client under %s > Updates > Image, then run this "
+                                 "step again"
+                                 % (cluster_name, len(drafts), "" if len(drafts) == 1 else "s",
+                                    ", ".join(owners), cluster_name))
+            source = hosts[0]
+        have = ("the desired image is already set (%s)" % image_spec_label(spec) if spec
+                else "the desired image is taken from %s first - what it runs becomes the "
+                     "image, so every host is compliant" % source.name)
         if not apply_:
             return ADD, ("%s: convert from baselines to a vLCM image, over the Image Manager "
-                         "enablement API, on %d eligible hosts running %s. One way - a cluster "
-                         "on an image cannot go back to baselines - so this needs --commit"
-                         % (cluster_name, len(hosts), running))
+                         "enablement API, on %d eligible hosts running %s; %s. One way - a "
+                         "cluster on an image cannot go back to baselines - so this needs "
+                         "--commit" % (cluster_name, len(hosts), running, have))
+
+        taken = ""
+        if spec is None:
+            try:
+                spec = self.image_from_host(moid, source, evidence, cluster_name)
+            except Exception as e:
+                return BLOCKED, self.image_by_hand(
+                    cluster_name, hosts, "the image could not be taken from %s (%s)"
+                    % (source.name, fault(e)))
+            taken = ", its image taken from %s (%s)" % (source.name, image_spec_label(spec))
 
         ok, lines = self.image_check(moid)
         if evidence and lines:
@@ -1430,9 +1571,9 @@ class VSphere:
             return BLOCKED, self.image_by_hand(
                 cluster_name, hosts, "the enable task returned but the cluster still reports "
                                      "baseline management")
-        return ADD, ("%s is now managed by a vLCM image, seeded from what the hosts already "
-                     "run (%s), so nothing is non-compliant. Do not remediate"
-                     % (cluster_name, running))
+        return ADD, ("%s is now managed by a vLCM image%s, the desired image being what the "
+                     "hosts already run (%s), so nothing is non-compliant. Do not remediate"
+                     % (cluster_name, taken, running))
 
     # What a refusal actually means, and what to do about it. An eligibility
     # condition is a property of the cluster, so the vSphere Client refuses for the
@@ -1456,7 +1597,7 @@ class VSphere:
         ("remediation", True,
          "a host is mid-remediation through Update Manager. Let it finish, then run this "
          "step again."),
-        ("software specification", False, None),   # the one case Setup Image is the answer
+        ("software specification", False, None),   # after the import, Setup Image is the answer
     )
 
     def image_by_hand(self, cluster_name, hosts, because):
@@ -1898,6 +2039,49 @@ def version_at_least(have, want):
     h, w = parts(have), parts(want)
     n = max(len(h), len(w))
     return h + [0] * (n - len(h)) >= w + [0] * (n - len(w))
+
+
+def image_spec_to_import(spec):
+    """The extracted software specification, in the shape the draft import takes.
+
+    createFromHost returns the host's software as a specification: base image,
+    add-on, components, hardware support. Solutions are left out, as the export API
+    leaves them out: a solution (NSX, the vSAN witness) is attached by the product
+    that owns it, not copied from a host. None when there is no base image in it.
+    """
+    if not isinstance(spec, dict):
+        return None
+    base = spec.get("base_image")
+    version = base.get("version") if isinstance(base, dict) else None
+    if not version:
+        return None
+    out = {"base_image": {"version": version}}
+    addon = spec.get("add_on")
+    if isinstance(addon, dict) and addon.get("name"):
+        out["add_on"] = {"name": addon["name"]}
+        if addon.get("version"):
+            out["add_on"]["version"] = addon["version"]
+    comps = spec.get("components")
+    if isinstance(comps, dict):
+        out["components"] = {k: (v.get("version") if isinstance(v, dict) else v)
+                             for k, v in comps.items()}
+    for key in ("hardware_support", "removed_components", "alternative_images"):
+        if spec.get(key):
+            out[key] = spec[key]
+    return out
+
+
+def image_spec_label(spec):
+    """One line naming an image: base image version, the add-on and the component count."""
+    base = (spec or {}).get("base_image") or {}
+    label = "ESXi %s" % (base.get("version") or "?")
+    addon = (spec or {}).get("add_on") or {}
+    if isinstance(addon, dict) and addon.get("name"):
+        label += ", add-on %s %s" % (addon["name"], addon.get("version") or "")
+    comps = (spec or {}).get("components")
+    if isinstance(comps, dict) and comps:
+        label += ", %d component%s" % (len(comps), "" if len(comps) == 1 else "s")
+    return label.rstrip()
 
 
 def upgrade_template(installer):
@@ -2344,6 +2528,15 @@ def _connect(cfg, st):
     return st["vs"]
 
 
+SEED_OFF = ("none", "no", "off", "false", "baseline", "baselines")
+
+
+def seed_wanted(value):
+    """cluster.image_seed_from as the code reads it: None for the values that mean no seed."""
+    text = str(value).strip() if value is not None else ""
+    return None if not text or text.lower() in SEED_OFF else text
+
+
 def step_objects(cfg, st, apply_):
     r = Result("objects")
     vs = _connect(cfg, st)
@@ -2353,8 +2546,9 @@ def step_objects(cfg, st, apply_):
     r.add(*vs.ensure_cluster(cfg["datacenter"], need(cfg, "cluster.name", "the cluster name"),
                              opt(cfg, "cluster.ha", True), opt(cfg, "cluster.drs", True),
                              opt(cfg, "cluster.evc"), apply_,
-                             seed=opt(cfg, "cluster.image_seed_from"),
-                             build=opt(cfg, "esx.build")))
+                             seed=seed_wanted(opt(cfg, "cluster.image_seed_from", "auto")),
+                             build=opt(cfg, "esx.build"), candidates=st.get("hosts") or (),
+                             password=lambda: st["pw"].get("esx_password")))
     return r
 
 
@@ -2597,15 +2791,16 @@ def step_ready(cfg, st, apply_):
         # remedy. A cluster that does not exist is not converted by --only image; it
         # is created by --only objects, already on an image when a seed is set. Saying
         # "baseline-managed" here sends the operator to a command that does nothing.
-        r.add(BLOCKED, "%s does not exist yet, so it has no image. Creating it with "
-                       "cluster.image_seed_from set makes it image-managed from birth - "
-                       "no conversion needed" % cfg["cluster"]["name"])
+        r.add(BLOCKED, "%s does not exist yet, so it has no image. Creating it (the objects "
+                       "step) seeds its image from a host unless cluster.image_seed_from is "
+                       "none - no conversion needed" % cfg["cluster"]["name"])
     else:
         imaged = bool(getattr(cl, "lifecycleManaged", False))
         r.add(OK if imaged else BLOCKED,
               "%s is managed by a vLCM image" % cfg["cluster"]["name"] if imaged else
               "%s is baseline-managed - the import refuses that. Run --only image --commit "
-              "to convert it (one way: a cluster on an image cannot go back to baselines)"
+              "to convert it: the image is taken from a host in it, then enabled (one way: "
+              "a cluster on an image cannot go back to baselines)"
               % cfg["cluster"]["name"])
     if not checked:
         r.add(BLOCKED, "%s on a dedicated portgroup: cannot tell, none of these %d hosts "
@@ -3027,6 +3222,11 @@ sites:
       name: cluster01
       ha: true
       drs: true
+      # image_seed_from: auto                # the host whose vLCM image the cluster is born on. Left out, auto:
+                                             # a connected host already in the vCenter at the build or, on a fresh
+                                             # vCenter, the first host below, which joins the cluster as it is made.
+                                             # A host name picks one; none makes a baseline-managed cluster, which
+                                             # the image step converts later
     network:
       vds: vds01
       mtu: 9000
@@ -3143,7 +3343,7 @@ class _FakeVS:
     def ensure_datacenter(self, name, apply_):
         return self._record("datacenter %s" % name, apply_)
 
-    def ensure_cluster(self, dc, name, ha, drs, evc, apply_, seed=None, build=None):
+    def ensure_cluster(self, dc, name, ha, drs, evc, apply_, seed=None, build=None, **kw):
         return self._record("cluster %s%s" % (name, " seeded from %s" % seed if seed else ""),
                             apply_)
 
@@ -3452,18 +3652,43 @@ def selftest():
 
         # ---- the real enablement call, against a stubbed REST side. The fake above
         # replaces the method wholesale, so only this exercises the API it drives.
-        def imaging(enabled=False, fail=None, flips=True, check_fails=False):
+        def imaging(enabled=False, fail=None, flips=True, check_fails=False, spec=True,
+                    drafts=None, spec_error=None, extract=None):
             calls = []
+            SPEC = "/esx/settings/clusters/domain-c8/software"
+            EXTRACT = {"result": {"depot": "depot-3"},
+                       "software_spec": {"base_image": {"version": "8.0.3-0.0.24585383"},
+                                         "add_on": {"name": "Vendor-Addon", "version": "1.0-1"},
+                                         "components": {"vendor-tool": "2.0-1"},
+                                         "solutions": {"com.example.agent": {"version": "1"}},
+                                         "hardware_support": {}},
+                       "notifications": {"info": [{"message": "extracted"}]}}
 
             class RestStub:
                 def call(self, method, path, body=None, timeout=300):
                     calls.append((method, path, body))
-                    if method == "GET":
+                    if method == "GET" and path.endswith("/enablement/software"):
                         return {"enabled": state["enabled"]}
-                    raise AssertionError("a mutation must go through task(), not call()")
+                    if method == "GET" and path == SPEC:
+                        if spec_error:
+                            raise RuntimeError("GET %s: %s" % (path, spec_error))
+                        if spec:
+                            return {"base_image": {"version": "8.0.3-0.0.24585383"},
+                                    "components": {}}
+                        raise RuntimeError("GET %s: 404 no desired software specification" % path)
+                    if method == "GET" and path == SPEC + "/drafts":
+                        return dict(drafts or {})
+                    if method == "POST" and path == SPEC + "/drafts?action=import-software-spec":
+                        state["imported"] = body
+                        return "draft-7"
+                    raise AssertionError("unexpected %s %s outside task()" % (method, path))
 
                 def task(self, method, path, body=None, minutes=60):
                     calls.append((method, path, body))
+                    if path.startswith("/esx/settings/depots/offline"):
+                        return EXTRACT if extract is None else extract
+                    if path.endswith("?action=commit"):
+                        return "commit-9"
                     if method == "POST" and check_fails:
                         raise RuntimeError("check refused")
                     if method == "PUT":
@@ -3473,8 +3698,8 @@ def selftest():
                             state["enabled"] = True
                     return {"notifications": {"info": [{"message": "all hosts eligible"}]}}
 
-            state = {"enabled": enabled}
-            host = type("H", (), {"name": "esx01.example.com",
+            state = {"enabled": enabled, "imported": None}
+            host = type("H", (), {"name": "esx01.example.com", "_moId": "host-12",
                                   "runtime": type("R", (), {"connectionState": "connected"})(),
                                   "config": type("C", (), {"product": type("P", (), {
                                       "version": "8.0.3", "build": "24585383"})()})()})()
@@ -3488,22 +3713,24 @@ def selftest():
 
         vs, calls, _ = imaging()
         state, detail = vs.ensure_cluster_image("cluster-a", False)
-        ck("image API: a plan reads the state and sends no mutation",
-           state == ADD and [c[0] for c in calls] == ["GET"])
+        vs, calls, _ = imaging()
+        state, detail = vs.ensure_cluster_image("cluster-a", False)
+        ck("image API: a plan reads the state and the desired image, and sends no mutation",
+           state == ADD and len(calls) == 2 and all(c[0] == "GET" for c in calls))
         ck("image API: the plan names the build the hosts run, which becomes the image",
            "8.0.3 build 24585383" in detail)
 
         vs, calls, state_ = imaging()
         state, detail = vs.ensure_cluster_image("cluster-a", True)
-        ck("image API: a commit checks first, then enables, then reads back",
-           state == ADD and [c[0] for c in calls] == ["GET", "POST", "PUT", "GET"])
+        ck("image API: a commit reads the image, checks, enables, then reads back",
+           state == ADD and [c[0] for c in calls] == ["GET", "GET", "POST", "PUT", "GET"])
         ck("image API: the check is the documented read-only action",
-           "action=check" in calls[1][1])
+           "action=check" in calls[2][1])
         ck("image API: the check spec carries checks_to_skip, which is required",
-           calls[1][2] == {"checks_to_skip": []})
+           calls[2][2] == {"checks_to_skip": []})
         ck("image API: enable is a PUT to the enablement resource with the documented spec",
-           calls[2][1] == "/esx/settings/clusters/domain-c8/enablement/software"
-           and calls[2][2] == {"skip_software_check": False})
+           calls[3][1] == "/esx/settings/clusters/domain-c8/enablement/software"
+           and calls[3][2] == {"skip_software_check": False})
         ck("image API: and it says not to remediate afterwards",
            "Do not remediate" in detail and state_["enabled"] is True)
 
@@ -3545,6 +3772,184 @@ def selftest():
         state, detail = vs.ensure_cluster_image("cluster-a", True)
         ck("image API: if the check cannot run, nothing one-way is attempted",
            state == BLOCKED and "PUT" not in [c[0] for c in calls])
+
+        # ---- a cluster created before its hosts joined has no desired image. The
+        # step takes one from a host in it before the one-way enable: what the
+        # vSphere Client's Setup Image > Import image from a host does.
+        vs, calls, state_ = imaging(spec=False)
+        state, detail = vs.ensure_cluster_image("cluster-a", False)
+        ck("image API: with no desired image, the plan says it is taken from a host first",
+           state == ADD and "taken from esx01.example.com first" in detail
+           and "--commit" in detail)
+        ck("image API: and that plan reads the image and the drafts only, sending no mutation",
+           all(c[0] == "GET" for c in calls) and calls[-1][1].endswith("/software/drafts"))
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as evd:
+            vs, calls, state_ = imaging(spec=False)
+            state, detail = vs.ensure_cluster_image("cluster-a", True, evd)
+            want = [("GET", "/esx/settings/clusters/domain-c8/enablement/software"),
+                    ("GET", "/esx/settings/clusters/domain-c8/software"),
+                    ("GET", "/esx/settings/clusters/domain-c8/software/drafts"),
+                    ("POST", "/esx/settings/depots/offline?action=createFromHost"),
+                    ("POST", "/esx/settings/clusters/domain-c8/software/drafts"
+                             "?action=import-software-spec"),
+                    ("POST", "/esx/settings/clusters/domain-c8/software/drafts/draft-7"
+                             "?action=commit"),
+                    ("POST", "/esx/settings/clusters/domain-c8/enablement/software?action=check"),
+                    ("PUT", "/esx/settings/clusters/domain-c8/enablement/software"),
+                    ("GET", "/esx/settings/clusters/domain-c8/enablement/software")]
+            ck("image API: no image: extract from the host, import as a draft, commit, check, "
+               "enable, read back", state == ADD and [(c[0], c[1]) for c in calls] == want,
+               [(c[0], c[1]) for c in calls])
+            ck("image API: the depot extract names the host by id, with the in-inventory auth type",
+               calls[3][2] == {"auth_type": "EXISTING", "host": "host-12"})
+            imported = json.loads((state_["imported"] or {}).get("software_spec") or "{}")
+            ck("image API: the draft is the extracted specification, imported as a JSON string",
+               (state_["imported"] or {}).get("source_type") == "JSON_STRING"
+               and imported.get("base_image") == {"version": "8.0.3-0.0.24585383"}
+               and imported.get("add_on") == {"name": "Vendor-Addon", "version": "1.0-1"}
+               and imported.get("components") == {"vendor-tool": "2.0-1"})
+            ck("image API: solutions are not copied from the host, as the export API does not",
+               "solutions" not in imported)
+            ck("image API: the commit message names the host the image came from",
+               "esx01.example.com" in (calls[5][2] or {}).get("message", ""))
+            ck("image API: the result says where the image came from and not to remediate",
+               state_["enabled"] is True and "taken from esx01.example.com" in detail
+               and "Do not remediate" in detail)
+            ck("image API: the imported specification is kept as evidence",
+               os.path.exists(os.path.join(evd, "image-cluster-a.spec.json")))
+
+        vs, calls, _ = imaging(spec=False, drafts={"draft-2": {
+            "owner": "VSPHERE.LOCAL\\jo", "status": "VALID",
+            "creation_time": "2026-10-23T10:00:00.000Z"}})
+        state, detail = vs.ensure_cluster_image("cluster-a", True)
+        ck("image API: an open draft blocks the import, naming its owner and where it lives",
+           state == BLOCKED and "jo" in detail and "Updates > Image" in detail
+           and not any(c[0] in ("POST", "PUT") for c in calls))
+        vs, calls, _ = imaging(spec=False, spec_error="503 service unavailable")
+        state, detail = vs.ensure_cluster_image("cluster-a", True)
+        ck("image API: an image that cannot be read is not mistaken for one that is missing",
+           state == BLOCKED and "cannot read" in detail
+           and not any(c[0] in ("POST", "PUT") for c in calls))
+        vs, calls, _ = imaging(spec=False, extract={"result": {"depot": "d"},
+                                                    "notifications": {}})
+        state, detail = vs.ensure_cluster_image("cluster-a", True)
+        ck("image API: an extract with no specification in it stops before anything one-way",
+           state == BLOCKED and "no software specification" in detail
+           and "PUT" not in [c[0] for c in calls])
+        vs, calls, _ = imaging(spec=True)
+        state, detail = vs.ensure_cluster_image("cluster-a", False)
+        ck("image API: a desired image already set is named and not replaced",
+           state == ADD and "already set (ESXi 8.0.3-0.0.24585383" in detail)
+
+        ck("image spec: the extract is cut down to what the draft import takes",
+           image_spec_to_import({"base_image": {"version": "8.0.3-0.0.1", "details": {"x": 1}},
+                                 "components": {"a": {"version": "1", "details": {}}, "b": "2"},
+                                 "solutions": {"s": {}},
+                                 "hardware_support": {"packages": {"p": {"pkg": "q",
+                                                                         "version": "3"}}}})
+           == {"base_image": {"version": "8.0.3-0.0.1"}, "components": {"a": "1", "b": "2"},
+               "hardware_support": {"packages": {"p": {"pkg": "q", "version": "3"}}}})
+        ck("image spec: no base image, no specification",
+           image_spec_to_import({"components": {}}) is None
+           and image_spec_to_import(None) is None)
+        ck("image spec label: base image, add-on and component count",
+           image_spec_label({"base_image": {"version": "8.0.3-0.0.1"},
+                             "add_on": {"name": "A", "version": "2"},
+                             "components": {"x": "1", "y": "2"}})
+           == "ESXi 8.0.3-0.0.1, add-on A 2, 2 components")
+
+        ck("seed: left out means auto, none and false mean no seed, a host name is kept",
+           seed_wanted("auto") == "auto" and seed_wanted("none") is None
+           and seed_wanted(False) is None and seed_wanted("off") is None
+           and seed_wanted(" esx02.example.com ") == "esx02.example.com")
+
+        # ---- the cluster's birth: seeded from a host in the vCenter, or from the
+        # site's first host when the vCenter is fresh and has none.
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        def _ns(name, **kw):
+            return type(name, (), kw)
+
+        stub_vim = _ns("vim", Datacenter=_ns("Datacenter"),
+                       ClusterComputeResource=_ns("ClusterComputeResource"),
+                       HostSystem=_ns("HostSystem"),
+                       cluster=_ns("cluster", ConfigSpecEx=_Spec),
+                       ComputeResource=_ns("ComputeResource", HostSeedSpec=type(
+                           "HostSeedSpec", (_Spec,), {"SingleHostSpec": _Spec})),
+                       host=_ns("host", ConnectSpec=_Spec))
+
+        def birth(in_vc=(), seed="auto", apply_=True, lifecycle=True, cert_fails=False,
+                  candidates=("esx01.example.com", "esx02.example.com")):
+            made, asked = {}, []
+
+            class Folder:
+                def CreateClusterEx(self, name, spec):
+                    made["spec"] = spec
+                    return _ns("CL", lifecycleManaged=lifecycle,
+                               ReconfigureComputeResource_Task=lambda s, spec, modify=True: None)()
+
+            dc = _ns("DC", hostFolder=Folder())()
+            hosts = [type("H", (), {"name": h,
+                                    "runtime": type("R", (), {"connectionState": "connected"})(),
+                                    "config": type("C", (), {"product": type("P", (), {
+                                        "build": "24585383"})()})()})() for h in in_vc]
+            vs = VSphere.__new__(VSphere)
+            vs.vim = stub_vim
+
+            def find(kind, name, root=None):
+                if kind is stub_vim.Datacenter:
+                    return dc
+                if kind is stub_vim.HostSystem:
+                    return next((h for h in hosts if h.name == name), None)
+                return None
+
+            def cnx(fqdn, password):
+                if cert_fails:
+                    raise OSError("connection refused")
+                asked.append((fqdn, password))
+                return stub_vim.host.ConnectSpec(hostName=fqdn, password=password)
+
+            vs.find, vs._all, vs.wait = find, (lambda kind, root=None: hosts), (lambda t: None)
+            vs.cluster_spec, vs.connect_spec = (lambda ha, drs: _Spec()), cnx
+            state, detail = vs.ensure_cluster("dc01", "cluster01", True, True, None, apply_,
+                                              seed=seed, build="24585383",
+                                              candidates=candidates, password=lambda: "pw")
+            return state, detail, made.get("spec"), asked
+
+        state, detail, spec, asked = birth(apply_=False)
+        ck("cluster birth: on a fresh vCenter the plan seeds from the site's first host, "
+           "which joins it", state == ADD and not asked
+           and "seeded from esx01.example.com, which joins it as its first host" in detail)
+        state, detail, spec, asked = birth()
+        ck("cluster birth: the create carries a connect spec for that host - one call joins "
+           "it and takes its image", state == CHANGE and asked == [("esx01.example.com", "pw")]
+           and spec.hostSeedSpec.singleHostSpec.newHostCnxSpec.hostName == "esx01.example.com"
+           and "joined it as its first host" in detail)
+        state, detail, spec, asked = birth(in_vc=("esx09.example.com",))
+        ck("cluster birth: a connected host already in the vCenter at the build is the seed, "
+           "as before", state == CHANGE and not asked
+           and getattr(spec.hostSeedSpec.singleHostSpec, "existingHost", None) is not None
+           and spec.hostSeedSpec.singleHostSpec.existingHost.name == "esx09.example.com")
+        state, detail, spec, asked = birth(seed="esx02.example.com")
+        ck("cluster birth: a named host of this site not in the vCenter yet joins as the seed",
+           spec.hostSeedSpec.singleHostSpec.newHostCnxSpec.hostName == "esx02.example.com")
+        state, detail, spec, asked = birth(seed=None)
+        ck("cluster birth: image_seed_from none creates it bare, baseline-managed",
+           state == ADD and not hasattr(spec, "hostSeedSpec") and detail == "created cluster cluster01")
+        state, detail, spec, asked = birth(cert_fails=True)
+        ck("cluster birth: a seed host whose certificate cannot be read blocks before the create",
+           state == BLOCKED and "certificate" in detail and spec is None)
+        state, detail, spec, asked = birth(lifecycle=False)
+        ck("cluster birth: a seed that did not take is reported as what it is, for the image step",
+           state == CHANGE and "did not take" in detail and "image step" in detail)
+        state, detail, spec, asked = birth(seed="esx77.example.com")
+        ck("cluster birth: a seed host that is nowhere is said so, and the cluster is still made",
+           state == CHANGE and "not seeded" in detail and "esx77" in detail
+           and not hasattr(spec, "hostSeedSpec"))
 
         ck("image API: the task poller waits on /cis/tasks and surfaces a failure",
            _vapi_task_cases())
